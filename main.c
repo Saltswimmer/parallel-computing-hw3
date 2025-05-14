@@ -17,7 +17,7 @@ generations>
 
 // Uncomment this macro to replace the randomized board with a glider
 // Use this with a small board size (10-20) to evaluate correctness
-#define DEBUG
+// #define DEBUG
 
 // Testing to see if forcing gcc to inline the functions significantly affected
 // performance. It did not. #define MAYBE_INLINE // Uncomment the macro to
@@ -55,25 +55,27 @@ MAYBE_INLINE void clone_edges(board_t board) {
         return;
     }
 
-    int dst = task_id - 1;
-    if (dst < 0) {
-        dst = num_tasks - 1;
+    int task_prev = task_id - 1;
+    if (task_prev < 0) {
+        task_prev = num_tasks - 1;
     }
+    int task_next = (task_id + 1) % num_tasks;
 
     cell_t *buf = malloc((2 + board_size) * sizeof(cell_t));
 
     MPI_Status result;
-    MPI_Sendrecv(board[1], 2 + board_size, MPI_BYTE, dst, task_id, buf,
-                 2 + board_size, MPI_BYTE, dst, dst, MPI_COMM_WORLD, &result);
 
-    memcpy(board[0], buf, (2 + board_size) * sizeof(cell_t));
-
-    dst = (task_id + 1) % num_tasks;
-    MPI_Sendrecv(board[num_block_rows - 2], 2 + board_size, MPI_BYTE, dst,
-                 task_id, buf, 2 + board_size, MPI_BYTE, dst, dst,
-                 MPI_COMM_WORLD, &result);
+    MPI_Sendrecv(board[1], 2 + board_size, MPI_BYTE, task_prev, task_id, buf,
+                 2 + board_size, MPI_BYTE, task_next, task_next, MPI_COMM_WORLD,
+                 &result);
 
     memcpy(board[num_block_rows - 1], buf, (2 + board_size) * sizeof(cell_t));
+
+    MPI_Sendrecv(board[num_block_rows - 2], 2 + board_size, MPI_BYTE, task_next,
+                 task_id, buf, 2 + board_size, MPI_BYTE, task_prev, task_prev,
+                 MPI_COMM_WORLD, &result);
+
+    memcpy(board[0], buf, (2 + board_size) * sizeof(cell_t));
     free(buf);
 }
 
@@ -216,34 +218,9 @@ int main(int argc, char **argv) {
             printf("Error! Could not initialize debug board\n");
         }
     }
-    /*
-    if (task_id == 1) {
-        for (int i = 0; i < num_block_rows; i++) {
-            for (int j = 0; j < board_size + 2; j++) {
-                printf("%d ", (unsigned int)block1[i][j]);
-            }
-            printf("\n");
-        }
-        printf("\n");
-        printf("Cloning edges\n");
-    }
-    */
 #endif
 
     clone_edges(block1);
-
-    /*
-    if (task_id == 1) {
-        printf("Done cloning edges\n");
-        for (int i = 0; i < num_block_rows; i++) {
-            for (int j = 0; j < board_size + 2; j++) {
-                printf("%d ", (unsigned int)block1[i][j]);
-            }
-            printf("\n");
-        }
-        printf("\n");
-    }
-    */
 
     double  before = gettime();
     int     generations_completed = 0;
@@ -252,9 +229,11 @@ int main(int argc, char **argv) {
     while (generations_completed < num_generations) {
         updates |= update(block1, block2);
 
+        /*
         if (!updates) {
             generations_completed = num_generations;
         }
+        */
 
         board_t temp = block1;
         block1 = block2;
@@ -266,35 +245,41 @@ int main(int argc, char **argv) {
 
     double after = gettime();
 
-    cell_t *buf =
-        (cell_t *)malloc(num_block_rows * (board_size + 2) * sizeof(cell_t));
     if (task_id) {
-        for (int i = 0; i < num_block_rows; i++) {
-            memcpy(buf + i * (board_size + 2), block1[i], board_size + 2);
+        cell_t *local_buf = (cell_t *)malloc((num_block_rows - 2) * board_size *
+                                             sizeof(cell_t));
+        for (int i = 0; i < num_block_rows - 2; i++) {
+            memcpy(local_buf + i * board_size, &(block1[i + 1][1]), board_size);
         }
-        MPI_Gather(buf, num_block_rows * (board_size + 2), MPI_BYTE, NULL, 0,
-                   MPI_BYTE, 0, MPI_COMM_WORLD);
+
+        MPI_Gatherv(local_buf, (num_block_rows - 2) * board_size, MPI_BYTE,
+                    NULL, NULL, NULL, MPI_BYTE, 0, MPI_COMM_WORLD);
+        free(local_buf);
 
     } else {
-        printf("Completed %d generations. Runtime in seconds: %lf\n\n",
-               generations_completed, after - before);
 
-        cell_t *output_buffer = (cell_t *)malloc(
-            (board_size + 2) * (board_size + 2) * sizeof(cell_t));
-
-        for (int i = 0; i < num_block_rows; i++) {
-            memcpy(buf + i * (board_size + 2), block1[i], board_size + 2);
+        cell_t *local_buf = (cell_t *)malloc((num_block_rows - 2) * board_size *
+                                             sizeof(cell_t));
+        for (int i = 0; i < num_block_rows - 2; i++) {
+            memcpy(local_buf + i * board_size, &(block1[i + 1][1]), board_size);
         }
-        MPI_Gather(buf, (board_size + 2) * (2 + board_size / num_tasks),
-                   MPI_BYTE, output_buffer,
-                   (board_size + 2) * (2 + board_size / num_tasks), MPI_BYTE, 0,
-                   MPI_COMM_WORLD);
 
-        for (int i = 2 + board_size / num_tasks; i < num_block_rows; i++) {
-            for (int j = 0; j < 2 + board_size; j++) {
-                output_buffer[i * (2 + board_size) + j] = block1[i][j];
-            }
+        cell_t *output_buffer =
+            (cell_t *)malloc(board_size * board_size * sizeof(cell_t));
+
+        int recv_size_buffer[num_tasks];
+        int displ_buffer[num_tasks];
+        recv_size_buffer[0] = (num_block_rows - 2) * board_size;
+        displ_buffer[0] = 0;
+        for (int i = 1; i < num_tasks; i++) {
+            recv_size_buffer[i] = board_size * (board_size / num_tasks);
+            displ_buffer[i] = displ_buffer[i - 1] + recv_size_buffer[i - 1];
         }
+
+        MPI_Gatherv(local_buf, (num_block_rows - 2) * board_size, MPI_BYTE,
+                    output_buffer, recv_size_buffer, displ_buffer, MPI_BYTE, 0,
+                    MPI_COMM_WORLD);
+        free(local_buf);
 
         FILE *outfile = fopen("output.txt", "w");
         if (!outfile) {
@@ -304,10 +289,10 @@ int main(int argc, char **argv) {
                     "Completed %d generations. Runtime in seconds: %lf\n\n",
                     generations_completed, after - before);
 
-            for (int i = 1; i < board_size + 1; i++) {
-                for (int j = 1; j < board_size + 1; j++) {
+            for (int i = 0; i < board_size; i++) {
+                for (int j = 0; j < board_size; j++) {
                     fprintf(outfile, "%c ",
-                            '0' + output_buffer[i * (board_size + 2) + j]);
+                            '0' + output_buffer[i * board_size + j]);
                 }
                 fputc('\n', outfile);
             }
@@ -323,7 +308,6 @@ int main(int argc, char **argv) {
     }
     free(block1);
     free(block2);
-    free(buf);
 
     MPI_Finalize();
     return 0;
