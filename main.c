@@ -19,6 +19,9 @@ generations>
 // Use this with a small board size (10-20) to evaluate correctness
 // #define DEBUG
 
+// Uncomment this macro to use non-blocking versions
+// #define NONBLOCKING
+
 // Testing to see if forcing gcc to inline the functions significantly affected
 // performance. It did not. #define MAYBE_INLINE // Uncomment the macro to
 // disable inlining
@@ -62,7 +65,32 @@ MAYBE_INLINE void clone_edges(board_t board) {
     int task_next = (task_id + 1) % num_tasks;
 
     cell_t *buf = malloc((2 + board_size) * sizeof(cell_t));
+#ifdef NONBLOCKING
+    cell_t *buf2 = malloc((2 + board_size) * sizeof(cell_t));
 
+    MPI_Request request1, request2;
+    MPI_Status  status1, status2;
+
+    MPI_Isendrecv(board[1], 2 + board_size, MPI_BYTE, task_prev, task_id, buf,
+                  2 + board_size, MPI_BYTE, task_next, task_next,
+                  MPI_COMM_WORLD, &request1);
+
+    MPI_Isendrecv(board[num_block_rows - 2], 2 + board_size, MPI_BYTE,
+                  task_next, task_id, buf2, 2 + board_size, MPI_BYTE, task_prev,
+                  task_prev, MPI_COMM_WORLD, &request2);
+
+    MPI_Wait(&request1, &status1);
+
+    memcpy(board[num_block_rows - 1], buf, (2 + board_size) * sizeof(cell_t));
+    free(buf);
+
+    MPI_Wait(&request2, &status2);
+
+    memcpy(board[0], buf2, (2 + board_size) * sizeof(cell_t));
+
+    free(buf2);
+
+#else
     MPI_Status result;
 
     MPI_Sendrecv(board[1], 2 + board_size, MPI_BYTE, task_prev, task_id, buf,
@@ -77,6 +105,8 @@ MAYBE_INLINE void clone_edges(board_t board) {
 
     memcpy(board[0], buf, (2 + board_size) * sizeof(cell_t));
     free(buf);
+
+#endif
 }
 
 MAYBE_INLINE uint8_t update_cell(board_t current, board_t next, int x, int y) {
@@ -281,22 +311,26 @@ int main(int argc, char **argv) {
                     MPI_COMM_WORLD);
         free(local_buf);
 
-        FILE *outfile = fopen("output.txt", "w");
-        if (!outfile) {
-            printf("Failed to open output file for writing\n");
-        } else {
-            fprintf(outfile,
-                    "Completed %d generations. Runtime in seconds: %lf\n\n",
-                    generations_completed, after - before);
+        printf("Completed %d generations. Runtime in seconds: %lf\n",
+               generations_completed, after - before);
+        if (board_size <= 40) {
+            FILE *outfile = fopen("output.txt", "w");
+            if (!outfile) {
+                printf("Failed to open output file for writing\n");
+            } else {
+                fprintf(outfile,
+                        "Completed %d generations. Runtime in seconds: %lf\n\n",
+                        generations_completed, after - before);
 
-            for (int i = 0; i < board_size; i++) {
-                for (int j = 0; j < board_size; j++) {
-                    fprintf(outfile, "%c ",
-                            '0' + output_buffer[i * board_size + j]);
+                for (int i = 0; i < board_size; i++) {
+                    for (int j = 0; j < board_size; j++) {
+                        fprintf(outfile, "%c ",
+                                '0' + output_buffer[i * board_size + j]);
+                    }
+                    fputc('\n', outfile);
                 }
-                fputc('\n', outfile);
+                fclose(outfile);
             }
-            fclose(outfile);
         }
 
         free(output_buffer);
